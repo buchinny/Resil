@@ -13,11 +13,12 @@ from bot_helpers import (
     print_startup_banner,
     silence_noisy_dependencies,
 )
+from api_services import ApiSettings, search_research
 
+dotenv.load_dotenv()
 silence_noisy_dependencies()
 
 from forecasting_tools import (
-    AskNewsSearcher,
     BinaryQuestion,
     ForecastBot,
     GeneralLlm,
@@ -36,12 +37,11 @@ from forecasting_tools import (
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
     structure_output,
 )
 
-dotenv.load_dotenv()
+API_SETTINGS = ApiSettings.from_env()
 logger = logging.getLogger(__name__)
 
 
@@ -79,35 +79,6 @@ class FallTemplateBot2026(ForecastBot):
     of them from the 'tournament' mode code at the bottom of the file.
 
     You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name")
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
     If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
     ```python
     from forecasting_tools import RefreshingBucketRateLimiter
@@ -117,7 +88,6 @@ class FallTemplateBot2026(ForecastBot):
     ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
     await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
     ```
-    Additionally OpenRouter has large rate limits immediately on account creation
     """
 
     _max_concurrent_questions = (
@@ -130,63 +100,18 @@ class FallTemplateBot2026(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = self._get_research_prompt(question, researcher)
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+            query = clean_indents(
+                f"""
+                Question: {question.question_text}
+                Resolution criteria: {question.resolution_criteria}
+                {question.fine_print}
+                """
+            )
+            research = await asyncio.to_thread(
+                search_research, query, API_SETTINGS
+            )
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
-
-    @staticmethod
-    def _get_research_prompt(
-        question: MetaculusQuestion, researcher: str | GeneralLlm
-    ) -> str:
-        if GeneralLlm.to_model_name(researcher) == "asknews/news-summaries":
-            return question.question_text
-
-        prompt = clean_indents(
-            f"""
-            You are an assistant to a superforecaster.
-            The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-            You do not produce forecasts yourself.
-
-            Question:
-            {question.question_text}
-
-            This question's outcome will be determined by the specific criteria below:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-            """
-        )
-        return prompt
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -704,9 +629,9 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Use both configured LLM providers when both are available: Gemini reasons,
+    # while NVIDIA NIM parses structured predictions.
+    primary_model, parser_model = API_SETTINGS.llm_models()
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -715,17 +640,18 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model=primary_model,
+                temperature=0.3,
+                api_key=API_SETTINGS.llm_api_key(primary_model),
+            ),
+            "parser": GeneralLlm(
+                model=parser_model,
+                temperature=0,
+                api_key=API_SETTINGS.llm_api_key(parser_model),
+            ),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These

@@ -3,32 +3,15 @@ Runtime helpers for the template bot: environment validation, startup/result
 banners, and suppression of noisy upstream warnings.
 
 Kept separate from main.py so that file can focus on the bot's forecasting
-logic. main_with_no_framework.py keeps its own inline copies on purpose --
-it's meant to be a single-file reference implementation.
+logic. Both bot implementations share API configuration and clients through
+api_services.py.
 """
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import warnings
 from typing import Any, Sequence
-
-
-# Placeholder values shipped in .env.template. If a real env var still equals
-# one of these the user forgot to replace it; we'd rather fail loudly here than
-# inside the SDK three layers down.
-_PLACEHOLDER_ENV_VALUES = {
-    "1234567890",
-    "REPLACE_ME",
-    "your-token-here",
-    "your-api-key-here",
-}
-
-
-def _is_real_env(name: str) -> bool:
-    val = os.getenv(name)
-    return bool(val and val.strip() and val.strip() not in _PLACEHOLDER_ENV_VALUES)
 
 
 def silence_noisy_dependencies() -> None:
@@ -57,35 +40,23 @@ def silence_noisy_dependencies() -> None:
 
 def check_environment(strict: bool = True) -> None:
     """
-    Verify METACULUS_TOKEN and at least one LLM key are set. On failure with
-    strict=True, exits the process with a non-zero status.
+    Verify the Metaculus token and at least one approved LLM key.
     """
-    problems: list[str] = []
+    from api_services import ApiSettings
 
-    if not _is_real_env("METACULUS_TOKEN"):
-        problems.append(
-            "METACULUS_TOKEN is missing or still a placeholder. "
-            "Get one at https://www.metaculus.com/futureeval/participate/"
-        )
-
-    has_llm_key = any(
-        _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
-    )
-    if not has_llm_key:
-        problems.append(
-            "No LLM key set. Set OPENROUTER_API_KEY, OPENAI_API_KEY or "
-            "ANTHROPIC_API_KEY (free OpenRouter credits: "
-            "https://forms.gle/aQdYMq9Pisrf1v7d8). The Metaculus LLM proxy that "
-            "the bot used to fall back to is no longer available."
-        )
+    settings = ApiSettings.from_env()
+    problems = settings.validation_problems()
 
     if problems:
-        print("❌  Setup problems:")
+        print("Setup problems:")
         for p in problems:
-            print(f"    • {p}")
+            print(f"    - {p}")
         if strict:
             sys.exit(1)
+    elif not any(
+        (settings.exa_api_secret, settings.parallel_api_key, settings.tavily_api_key)
+    ):
+        print("No Exa, Parallel, or Tavily key set; forecasts will run without search.")
 
 
 def print_startup_banner(run_mode: str, will_publish: bool) -> None:

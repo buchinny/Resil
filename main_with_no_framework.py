@@ -4,7 +4,6 @@ import asyncio
 from collections import Counter
 import datetime
 import json
-import os
 import re
 import sys
 
@@ -12,21 +11,22 @@ import dotenv
 
 dotenv.load_dotenv()
 
-import forecasting_tools
 import numpy as np
 import requests
-from asknews_sdk import AskNewsSDK
-from openai import AsyncOpenAI
+from litellm import acompletion
 from pydantic import BaseModel, Field, model_validator
+
+from api_services import ApiSettings, search_research
+
+API_SETTINGS = ApiSettings.from_env()
 
 """
 This file provides a simple forecasting bot built from the ground up.
 We provide this for people who want to dissect
 it to build their own bot without using forecasting-tools.
 
-This template assumes you are using a OpenAI model and have an OpenAI API key
-You will also need a Metaculus API key, for posting questions to Metaculus
-and a Perplexity or AskNews API key for online research
+This template uses Gemini or NVIDIA NIM for forecasts, configured search
+providers for research, and Metaculus for reading and submitting forecasts.
 
 This is not a representative of the template bots used by Metaculus, as there are some
 differences in implementation. The actual template bot (e.g. like main.py) has the following differences:
@@ -42,8 +42,6 @@ Though we are assuming most people will dissect it enough to make this not matte
 Note that this is code is given as-is and though we have have done basic testing
 with this file it may be worth double checking key components locally.
 
-Updates pending for Spring season:
-- AskNews can now use ASKNEWS_API_KEY via client api_key parameter
 """
 
 
@@ -56,16 +54,7 @@ NUM_RUNS_PER_QUESTION = (
 )
 SKIP_PREVIOUSLY_FORECASTED_QUESTIONS = True
 
-# Environment variables
-# You only need *either* Exa or Perplexity or AskNews keys for online research
-METACULUS_TOKEN = os.getenv("METACULUS_TOKEN")
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-ASKNEWS_CLIENT_ID = os.getenv("ASKNEWS_CLIENT_ID")
-ASKNEWS_SECRET = os.getenv("ASKNEWS_SECRET")
-EXA_API_KEY = os.getenv("EXA_API_KEY")
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY"
-)  # You'll also need the OpenAI API Key if you want to use the Exa Smart Searcher
+METACULUS_TOKEN = API_SETTINGS.metaculus_token
 
 # The tournament IDs below can be used for testing your bot.
 Q4_2024_AI_BENCHMARKING_ID = 32506
@@ -246,22 +235,17 @@ CONCURRENT_REQUESTS_LIMIT = 5
 llm_rate_limiter = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3) -> str:
-    """
-    Makes a streaming completion request to OpenAI's API with concurrent request limiting.
-    """
-
-    # Remove the base_url parameter to call the OpenAI API directly
-    # Also checkout the package 'litellm' for one function that can call any model from any provider
-    # Also checkout OpenRouter for allowing one API key for many providers (especially powerful if combined with litellm)
-    client = AsyncOpenAI()
-
+async def call_llm(
+    prompt: str, model: str | None = None, temperature: float = 0.3
+) -> str:
+    """Request a completion from the configured Gemini or NVIDIA NIM model."""
     async with llm_rate_limiter:
-        response = await client.chat.completions.create(
-            model=model,
+        selected_model = model or API_SETTINGS.llm_models()[0]
+        response = await acompletion(
+            model=selected_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
-            stream=False,
+            api_key=API_SETTINGS.llm_api_key(selected_model),
         )
         answer = response.choices[0].message.content
         if answer is None:
@@ -269,142 +253,12 @@ async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3)
         return answer
 
 
-def run_research(question: str) -> str:
-    research = ""
-    if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = call_asknews(question)
-    elif EXA_API_KEY:
-        research = call_exa_smart_searcher(question)
-    elif PERPLEXITY_API_KEY:
-        research = call_perplexity(question)
-    else:
-        research = "No research done"
-
+async def run_research(question: str) -> str:
+    research = await asyncio.to_thread(search_research, question, API_SETTINGS)
     print(
         f"########################\nResearch Found:\n{research}\n########################"
     )
-
     return research
-
-
-def call_perplexity(question: str) -> str:
-    url = "https://api.perplexity.ai/chat/completions"
-    api_key = PERPLEXITY_API_KEY
-    headers = {
-        "accept": "application/json",
-        "authorization": f"Bearer {api_key}",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": "llama-3.1-sonar-huge-128k-online",
-        "messages": [
-            {
-                "role": "system",  # this is a system prompt designed to guide the perplexity assistant
-                "content": """
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-                """,
-            },
-            {
-                "role": "user",  # this is the actual prompt we ask the perplexity assistant to answer
-                "content": question,
-            },
-        ],
-    }
-    response = requests.post(url=url, json=payload, headers=headers)
-    if not response.ok:
-        raise Exception(response.text)
-    content = response.json()["choices"][0]["message"]["content"]
-    return content
-
-
-def call_exa_smart_searcher(question: str) -> str:
-    if OPENAI_API_KEY is None:
-        searcher = forecasting_tools.ExaSearcher(
-            include_highlights=True,
-            num_results=10,
-        )
-        highlights = asyncio.run(
-            searcher.invoke_for_highlights_in_relevance_order(question)
-        )
-        prioritized_highlights = highlights[:10]
-        combined_highlights = ""
-        for i, highlight in enumerate(prioritized_highlights):
-            combined_highlights += f'[Highlight {i+1}]:\nTitle: {highlight.source.title}\nURL: {highlight.source.url}\nText: "{highlight.highlight_text}"\n\n'
-        response = combined_highlights
-    else:
-        searcher = forecasting_tools.SmartSearcher(
-            temperature=0,
-            num_searches_to_run=2,
-            num_sites_per_search=10,
-        )
-        prompt = (
-            "You are an assistant to a superforecaster. The superforecaster will give"
-            "you a question they intend to forecast on. To be a great assistant, you generate"
-            "a concise but detailed rundown of the most relevant news, including if the question"
-            "would resolve Yes or No based on current information. You do not produce forecasts yourself."
-            f"\n\nThe question is: {question}"
-        )
-        response = asyncio.run(searcher.invoke(prompt))
-        assert response is not None
-
-    return response
-
-
-def call_asknews(question: str) -> str:
-    """
-    Use the AskNews `news` endpoint to get news context for your query.
-    The full API reference can be found here: https://docs.asknews.app/en/reference#get-/v1/news/search
-    """
-    ask = AskNewsSDK(
-        client_id=ASKNEWS_CLIENT_ID, client_secret=ASKNEWS_SECRET, scopes=set(["news"])
-    )
-
-    # get the latest news related to the query (within the past 48 hours)
-    hot_response = ask.news.search_news(
-        query=question,  # your natural language query
-        n_articles=6,  # control the number of articles to include in the context, originally 5
-        return_type="both",
-        strategy="latest news",  # enforces looking at the latest news only
-    )
-
-    # get context from the "historical" database that contains a news archive going back to 2023
-    historical_response = ask.news.search_news(
-        query=question,
-        n_articles=10,
-        return_type="both",
-        strategy="news knowledge",  # looks for relevant news within the past 60 days
-    )
-
-    hot_articles = hot_response.as_dicts
-    historical_articles = historical_response.as_dicts
-    formatted_articles = "Here are the relevant news articles:\n\n"
-
-    if hot_articles:
-        hot_articles = [article.__dict__ for article in hot_articles]
-        hot_articles = sorted(hot_articles, key=lambda x: x["pub_date"], reverse=True)
-
-        for article in hot_articles:
-            pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += f"**{article['eng_title']}**\n{article['summary']}\nOriginal language: {article['language']}\nPublish date: {pub_date}\nSource:[{article['source_id']}]({article['article_url']})\n\n"
-
-    if historical_articles:
-        historical_articles = [article.__dict__ for article in historical_articles]
-        historical_articles = sorted(
-            historical_articles, key=lambda x: x["pub_date"], reverse=True
-        )
-
-        for article in historical_articles:
-            pub_date = article["pub_date"].strftime("%B %d, %Y %I:%M %p")
-            formatted_articles += f"**{article['eng_title']}**\n{article['summary']}\nOriginal language: {article['language']}\nPublish date: {pub_date}\nSource:[{article['source_id']}]({article['article_url']})\n\n"
-
-    if not hot_articles and not historical_articles:
-        formatted_articles += "No articles were found.\n\n"
-        return formatted_articles
-
-    return formatted_articles
 
 
 ############### BINARY ###############
@@ -458,7 +312,7 @@ def extract_probability_from_response_as_percentage_not_decimal(
         raise ValueError(f"Could not extract prediction from response: {forecast_text}")
 
 
-async def get_binary_gpt_prediction(
+async def get_binary_llm_prediction(
     question_details: dict, num_runs: int
 ) -> tuple[float, str]:
 
@@ -469,7 +323,7 @@ async def get_binary_gpt_prediction(
     fine_print = question_details["fine_print"]
     question_type = question_details["type"]
 
-    summary_report = run_research(title)
+    summary_report = await run_research(title)
 
     content = BINARY_PROMPT_TEMPLATE.format(
         title=title,
@@ -487,7 +341,7 @@ async def get_binary_gpt_prediction(
             rationale
         )
         comment = (
-            f"Extracted Probability: {probability}%\n\nGPT's Answer: "
+            f"Extracted Probability: {probability}%\n\nLLM answer: "
             f"{rationale}\n\n\n"
         )
         return probability, comment
@@ -1116,7 +970,7 @@ class NumericDistribution(BaseModel):
         return scaled_location
 
 
-async def get_numeric_gpt_prediction(
+async def get_numeric_llm_prediction(
     question_details: dict, num_runs: int
 ) -> tuple[list[float], str]:
 
@@ -1153,7 +1007,7 @@ async def get_numeric_gpt_prediction(
     else:
         lower_bound_message = f"The outcome can not be lower than {lower_bound}."
 
-    summary_report = run_research(title)
+    summary_report = await run_research(title)
 
     content = NUMERIC_PROMPT_TEMPLATE.format(
         title=title,
@@ -1172,7 +1026,7 @@ async def get_numeric_gpt_prediction(
         percentile_values = extract_percentiles_from_response(rationale)
 
         comment = (
-            f"Extracted Percentile_values: {percentile_values}\n\nGPT's Answer: "
+            f"Extracted Percentile_values: {percentile_values}\n\nLLM answer: "
             f"{rationale}\n\n\n"
         )
 
@@ -1323,7 +1177,7 @@ def generate_multiple_choice_forecast(options, option_probabilities) -> dict:
     return probability_yes_per_category
 
 
-async def get_multiple_choice_gpt_prediction(
+async def get_multiple_choice_llm_prediction(
     question_details: dict,
     num_runs: int,
 ) -> tuple[dict[str, float], str]:
@@ -1336,7 +1190,7 @@ async def get_multiple_choice_gpt_prediction(
     question_type = question_details["type"]
     options = question_details["options"]
 
-    summary_report = run_research(title)
+    summary_report = await run_research(title)
 
     content = MULTIPLE_CHOICE_PROMPT_TEMPLATE.format(
         title=title,
@@ -1358,7 +1212,7 @@ async def get_multiple_choice_gpt_prediction(
         )
 
         comment = (
-            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nGPT's Answer: "
+            f"EXTRACTED_PROBABILITIES: {option_probabilities}\n\nLLM answer: "
             f"{rationale}\n\n\n"
         )
 
@@ -1442,19 +1296,19 @@ async def forecast_individual_question(
         return summary_of_forecast
 
     if question_type == "binary":
-        forecast, comment = await get_binary_gpt_prediction(
+        forecast, comment = await get_binary_llm_prediction(
             question_details, num_runs_per_question
         )
     elif question_type == "numeric":
-        forecast, comment = await get_numeric_gpt_prediction(
+        forecast, comment = await get_numeric_llm_prediction(
             question_details, num_runs_per_question
         )
     elif question_type == "discrete":
-        forecast, comment = await get_numeric_gpt_prediction(
+        forecast, comment = await get_numeric_llm_prediction(
             question_details, num_runs_per_question
         )
     elif question_type == "multiple_choice":
-        forecast, comment = await get_multiple_choice_gpt_prediction(
+        forecast, comment = await get_multiple_choice_llm_prediction(
             question_details, num_runs_per_question
         )
     else:
@@ -1535,42 +1389,19 @@ async def forecast_questions(
         raise RuntimeError(f"Errors were encountered: {errors}")
 
 
-# Inline helpers kept here on purpose: this file is meant to be a single-file
-# reference implementation that can be dissected without chasing imports.
-_PLACEHOLDER_ENV_VALUES = {"1234567890", "REPLACE_ME", "your-token-here", "your-api-key-here"}
-
-
-def _is_real_env(name: str) -> bool:
-    val = os.getenv(name)
-    return bool(val and val.strip() and val.strip() not in _PLACEHOLDER_ENV_VALUES)
-
-
 def check_environment(strict: bool = True) -> None:
-    """Surface missing/placeholder keys before we crash inside requests/openai."""
-    problems: list[str] = []
-    if not _is_real_env("METACULUS_TOKEN"):
-        problems.append(
-            "METACULUS_TOKEN missing/placeholder. "
-            "Get one at https://www.metaculus.com/futureeval/participate/"
-        )
-    if not _is_real_env("OPENAI_API_KEY"):
-        problems.append(
-            "OPENAI_API_KEY missing/placeholder. This file calls the OpenAI API "
-            "directly; either set the key, or use main.py instead."
-        )
-
-    if not any(_is_real_env(k) for k in ("PERPLEXITY_API_KEY", "ASKNEWS_SECRET", "EXA_API_KEY")):
-        print(
-            "⚠️  No search-provider key (PERPLEXITY/ASKNEWS/EXA). Online "
-            "research will fail.\n"
-        )
-
+    """Validate Metaculus and approved LLM credentials before starting."""
+    problems = API_SETTINGS.validation_problems()
     if problems:
-        print("❌  Setup problems:")
+        print("Setup problems:")
         for p in problems:
-            print(f"    • {p}")
+            print(f"    - {p}")
         if strict:
             sys.exit(1)
+    elif not any(
+        (API_SETTINGS.exa_api_secret, API_SETTINGS.parallel_api_key, API_SETTINGS.tavily_api_key)
+    ):
+        print("No Exa, Parallel, or Tavily key set; forecasts will run without search.")
 
 
 def _print_no_framework_summary_banner(

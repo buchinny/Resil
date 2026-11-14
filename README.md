@@ -1,7 +1,7 @@
 # Simple Metaculus forecasting bot
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
-**Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, paste two API keys into GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.
+**Brand new to this?** You can get a working bot running in about 5 minutes without writing a single line of code — just fork this repo, add your API secrets to GitHub, and click "Run workflow". See **[Quick start](#quick-start--fork-and-use-github-actions)** below.
 
 In this project are 2 files:
 - **main.py**: Our recommended template option that uses the [forecasting-tools](https://github.com/Metaculus/forecasting-tools) package to handle a lot of stuff in the background for you (such as API calls). We will update the package, thus allowing you to gain new features with minimal changes to your code.
@@ -21,12 +21,10 @@ If you run into trouble, reach out to `ben [at] metaculus [.com]`
 
 
 ## Quick start -> Fork and use Github Actions
-The easiest way to use this repo is to fork it, paste in two API keys, and click "Run workflow". After that, the bot will keep forecasting on new questions automatically every 20 minutes — no local setup needed.
+The easiest way to use this repo is to fork it, add the required API secrets, and click "Run workflow". After that, the bot will keep forecasting on new questions automatically every 20 minutes — no local setup needed.
 
 1) **Fork the repository**: go to the [repository](https://github.com/Metaculus/metac-bot-template) and click **Fork** in the top right.
-2) **Add your two API keys as repository secrets**: in your fork, go to `Settings → Secrets and variables → Actions → New repository secret`. Add these two (names must match exactly, all caps):
-   - **`METACULUS_TOKEN`** — create one at https://www.metaculus.com/futureeval/participate/ (see the [resources page](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#creating-your-bot-account-and-metaculus-token) if you get stuck).
-   - **`OPENROUTER_API_KEY`** — get free credits via [this form](https://forms.gle/aQdYMq9Pisrf1v7d8), or make your own key on [OpenRouter](https://openrouter.ai/). You can also use `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `PERPLEXITY_API_KEY`, `ASKNEWS_SECRET`, etc. — these all work out of the box if you set them.
+2) **Add API keys as repository secrets**: in your fork, go to `Settings → Secrets and variables → Actions → New repository secret`. Add `METACULUS_TOKEN` (see [how to create one](https://www.metaculus.com/futureeval/participate/)) and at least one of `GEMINI_API_KEY` or `NVIDIA_API_KEY`. For search, optionally add any of `EXA_API_SECRET`, `PARALLEL_API_KEY`, and `TAVILY_API_KEY`. Names must match exactly.
 3) **Enable Actions**: click the `Actions` tab, then click `I understand my workflows, go ahead and enable them`.
 4) **Run the test workflow to confirm everything works**: go to `Actions → Test Bot → Run workflow → Run workflow` (green button). This forecasts on whatever's currently open in the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/) so you can verify your setup posts forecasts to Metaculus end-to-end. Once the run finishes (~3–5 min), [switch to your bot account](#seeing-your-bots-forecasts) on Metaculus to check that the forecasts landed. They won't show up on your human account.
 5) **You're done! (and participation form)**: The `Forecast on new AI tournament questions` workflow is already enabled and will run every 20 minutes, picking up any new tournament questions and skipping ones it has already forecast on. Before you start submitting forecasts, all participants are required to fill out the first section of our [participation](https://forms.gle/aQdYMq9Pisrf1v7d8) form. There are only 3 required questions, so it should be pretty quick. This form is used to help us learn about the demographics and motivations of our community in FutureEval, amplify individual projects/research, and also to collect applications for LLM credits.
@@ -52,7 +50,7 @@ You can run any workflow against any branch — no need to merge to `main` first
 The runner checks out your branch and uses the repo's existing secrets — those are scoped to the repo, not the branch, so they work for any branch in the same repo. This works for all three workflows.
 
 ## API Keys
-Instructions for getting your METACULUS_TOKEN, OPENROUTER_API_KEY, or optional search provider API keys (AskNews, Exa, Perplexity, etc) are listed on the "Getting Started" section of the [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page.
+The bot supports Gemini and NVIDIA NIM for language models, Exa, Parallel, and Tavily for research, and Metaculus for forecasting. Configure at least one language-model key and optionally any or all of the search keys. If both model keys are configured, Gemini handles forecasting and NVIDIA NIM handles structured prediction parsing.
 
 ## Changing the Github automation
 To run a different script under the same workflows, edit the `uv run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
@@ -95,9 +93,9 @@ This creates a virtualenv in `.venv` inside the project, so most editors pick it
 ### 4. Set your API keys
 Copy the template and fill in your real keys:
 ```bash
-cp .env.template .env
+cp .env.example .env
 ```
-Then open `.env` in any text editor and replace each `REPLACE_ME` with your real key. At minimum you need `METACULUS_TOKEN` and one LLM key (`OPENROUTER_API_KEY` is recommended). See the comments inside `.env.template` for where to get each one.
+Then open `.env` in any text editor and replace the placeholders for the credentials you use. At minimum you need `METACULUS_TOKEN` and one of `GEMINI_API_KEY` or `NVIDIA_API_KEY`. Search keys are optional. See `.env.example` for the supported variables.
 
 ### 5. Run the bot
 **First run — smoke-test against the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/):**
@@ -136,100 +134,8 @@ helps to diagnose any reasoning errors.
 uv run --group integrations bot-review review --resolved-since 30
 ```
 
-A weekly workflow and a Claude Code skill come with it. See the
+A weekly workflow and a project skill come with it. See the
 [integrations README](integrations/README.md#bot-review).
-
-## Example usage of /news and /deepnews:
-If you are using AskNews, here is some useful example code.
-```python
-from asknews_sdk import AsyncAskNewsSDK
-import asyncio
-
-"""
-More information available here:
-https://docs.asknews.app/en/news
-https://docs.asknews.app/en/deepnews
-
-Installation:
-pip install asknews
-"""
-
-client_id = ""
-client_secret = ""
-
-ask = AsyncAskNewsSDK(
-    client_id=client_id,
-    client_secret=client_secret,
-    scopes=["chat", "news", "stories", "analytics"],
-)
-
-# /news endpoint example
-async def search_news(query):
-
-  hot_response = await ask.news.search_news(
-      query=query, # your natural language query
-      n_articles=5, # control the number of articles to include in the context
-      return_type="both",
-      strategy="latest news" # enforces looking at the latest news only
-  )
-
-  print(hot_response.as_string)
-
-  # get context from the "historical" database that contains a news archive going back to 2023
-  historical_response = await ask.news.search_news(
-      query=query,
-      n_articles=10,
-      return_type="both",
-      strategy="news knowledge" # looks for relevant news within the past 60 days
-  )
-
-  print(historical_response.as_string)
-
-# /deepnews endpoint example:
-async def deep_research(
-    query, sources, model, search_depth=2, max_depth=2
-):
-
-    response = await ask.chat.get_deep_news(
-        messages=[{"role": "user", "content": query}],
-        search_depth=search_depth,
-        max_depth=max_depth,
-        sources=sources,
-        stream=False,
-        return_sources=False,
-        model=model,
-        inline_citations="numbered"
-    )
-
-    print(response)
-
-
-if __name__ == "__main__":
-    query = "What is the TAM of the global market for electric vehicles in 2025? With your final report, please report the TAM in USD using the tags <TAM> ... </TAM>"
-
-    sources = ["asknews"]
-    model = "deepseek-basic"
-    search_depth = 2
-    max_depth = 2
-    asyncio.run(
-        deep_research(
-            query, sources, model, search_depth, max_depth
-        )
-    )
-
-    asyncio.run(search_news(query))
-```
-
-Some tips for DeepNews:
-
-You will get tags in your response, including:
-
-<think> </think>
-<asknews_search> </asknews_search>
-<final_response> </final_response>
-
-These tags are likely useful for extracting the pieces that you need for your pipeline. For example, if you don't want to include all the thinking/searching, you could just extract <final_response> </final_response>
-
 
 ## Integrations
 
