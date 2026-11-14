@@ -11,7 +11,8 @@ from __future__ import annotations
 import logging
 import sys
 import warnings
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 
 def silence_noisy_dependencies() -> None:
@@ -53,10 +54,8 @@ def check_environment(strict: bool = True) -> None:
             print(f"    - {p}")
         if strict:
             sys.exit(1)
-    elif not any(
-        (settings.exa_api_secret, settings.parallel_api_key, settings.tavily_api_key)
-    ):
-        print("No Exa, Parallel, or Tavily key set; forecasts will run without search.")
+    elif not settings.has_enabled_search:
+        print("No enabled search provider has a configured key; forecasts will run without search.")
 
 
 def print_startup_banner(run_mode: str, will_publish: bool) -> None:

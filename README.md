@@ -50,7 +50,7 @@ You can run any workflow against any branch — no need to merge to `main` first
 The runner checks out your branch and uses the repo's existing secrets — those are scoped to the repo, not the branch, so they work for any branch in the same repo. This works for all three workflows.
 
 ## API Keys
-The bot supports Gemini and NVIDIA NIM for language models, Exa, Parallel, and Tavily for research, and Metaculus for forecasting. Configure at least one language-model key and optionally any or all of the search keys. If both model keys are configured, Gemini handles forecasting and NVIDIA NIM handles structured prediction parsing.
+The bot supports Gemini and NVIDIA NIM for language models, Exa, Parallel, Tavily, and Gemini-grounded search for research, and Metaculus for forecasting. Configure at least one language-model key and optionally any or all of the search keys. NVIDIA calls use the free-tier serverless endpoint at `https://integrate.api.nvidia.com/v1`, rotate among DeepSeek R1, Qwen3 235B, and Llama 3.3 70B, and fall back to Gemini after transient throttling or timeout failures. NVIDIA requests are rate-spaced and concurrency-limited. Gemini grounded search is enabled when `GEMINI_API_KEY` is configured; each search source can be disabled with its `*_SEARCH_ENABLED` flag.
 
 ## Changing the Github automation
 To run a different script under the same workflows, edit the `uv run python main.py` line in the appropriate file under `.github/workflows/` and replace `main.py` with your script. The workflows that exist:
@@ -93,9 +93,9 @@ This creates a virtualenv in `.venv` inside the project, so most editors pick it
 ### 4. Set your API keys
 Copy the template and fill in your real keys:
 ```bash
-cp .env.example .env
+cp .env.template .env
 ```
-Then open `.env` in any text editor and replace the placeholders for the credentials you use. At minimum you need `METACULUS_TOKEN` and one of `GEMINI_API_KEY` or `NVIDIA_API_KEY`. Search keys are optional. See `.env.example` for the supported variables.
+Then open `.env` in any text editor and replace the placeholders for the credentials you use. At minimum you need `METACULUS_TOKEN` and one of `GEMINI_API_KEY` or `NVIDIA_API_KEY`. Search keys are optional. See `.env.template` for the supported variables and search-source flags.
 
 ### 5. Run the bot
 **First run — smoke-test against the [bot-testing-area tournament](https://www.metaculus.com/tournament/bot-testing-area/):**

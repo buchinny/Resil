@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 import datetime
 import json
 import re
 import sys
+from collections import Counter
 
 import dotenv
 
@@ -13,10 +13,9 @@ dotenv.load_dotenv()
 
 import numpy as np
 import requests
-from litellm import acompletion
 from pydantic import BaseModel, Field, model_validator
 
-from api_services import ApiSettings, search_research
+from api_services import ApiSettings, complete_llm, search_research
 
 API_SETTINGS = ApiSettings.from_env()
 
@@ -240,17 +239,12 @@ async def call_llm(
 ) -> str:
     """Request a completion from the configured Gemini or NVIDIA NIM model."""
     async with llm_rate_limiter:
-        selected_model = model or API_SETTINGS.llm_models()[0]
-        response = await acompletion(
-            model=selected_model,
-            messages=[{"role": "user", "content": prompt}],
+        return await complete_llm(
+            prompt,
+            API_SETTINGS,
+            model=model,
             temperature=temperature,
-            api_key=API_SETTINGS.llm_api_key(selected_model),
         )
-        answer = response.choices[0].message.content
-        if answer is None:
-            raise ValueError("No answer returned from LLM")
-        return answer
 
 
 async def run_research(question: str) -> str:
@@ -1398,10 +1392,8 @@ def check_environment(strict: bool = True) -> None:
             print(f"    - {p}")
         if strict:
             sys.exit(1)
-    elif not any(
-        (API_SETTINGS.exa_api_secret, API_SETTINGS.parallel_api_key, API_SETTINGS.tavily_api_key)
-    ):
-        print("No Exa, Parallel, or Tavily key set; forecasts will run without search.")
+    elif not API_SETTINGS.has_enabled_search:
+        print("No enabled search provider has a configured key; forecasts will run without search.")
 
 
 def _print_no_framework_summary_banner(

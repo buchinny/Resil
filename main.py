@@ -2,9 +2,18 @@ import argparse
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 import dotenv
+
+from api_services import (
+    GEMINI_MODEL,
+    NVIDIA_NIM_BASE_URL,
+    NVIDIA_NIM_MODELS,
+    ApiSettings,
+    complete_llm,
+    search_research,
+)
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -13,13 +22,17 @@ from bot_helpers import (
     print_startup_banner,
     silence_noisy_dependencies,
 )
-from api_services import ApiSettings, search_research
 
 dotenv.load_dotenv()
 silence_noisy_dependencies()
 
 from forecasting_tools import (
+    BinaryPrediction,
     BinaryQuestion,
+    ConditionalPrediction,
+    ConditionalQuestion,
+    DatePercentile,
+    DateQuestion,
     ForecastBot,
     GeneralLlm,
     MetaculusClient,
@@ -27,15 +40,10 @@ from forecasting_tools import (
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
-    DateQuestion,
-    DatePercentile,
     Percentile,
-    ConditionalQuestion,
-    ConditionalPrediction,
-    PredictionTypes,
-    PredictionAffirmed,
-    BinaryPrediction,
     PredictedOptionList,
+    PredictionAffirmed,
+    PredictionTypes,
     ReasonedPrediction,
     clean_indents,
     structure_output,
@@ -43,6 +51,41 @@ from forecasting_tools import (
 
 API_SETTINGS = ApiSettings.from_env()
 logger = logging.getLogger(__name__)
+
+
+class ResilientGeneralLlm(GeneralLlm):
+    """Keep forecasting-tools parsing while routing calls through approved APIs."""
+
+    def __init__(
+        self, provider_model: str, temperature: float, settings: ApiSettings
+    ) -> None:
+        self.provider_model = provider_model
+        self.api_settings = settings
+        if provider_model == "nvidia_nim":
+            model = f"openai/{NVIDIA_NIM_MODELS[0]}"
+            api_key = settings.nvidia_api_key
+            base_url = NVIDIA_NIM_BASE_URL
+        else:
+            model = GEMINI_MODEL
+            api_key = settings.gemini_api_key
+            base_url = None
+        super().__init__(
+            model=model,
+            temperature=temperature,
+            api_key=api_key,
+            base_url=base_url,
+            allowed_tries=1,
+        )
+
+    async def invoke(self, prompt: Any, system_prompt: str | None = None) -> str:
+        messages = self.model_input_to_message(prompt, system_prompt)
+        temperature = self.litellm_kwargs.get("temperature")
+        return await complete_llm(
+            messages,
+            self.api_settings,
+            model=self.provider_model,
+            temperature=float(temperature) if temperature is not None else 0.3,
+        )
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -629,8 +672,8 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Use both configured LLM providers when both are available: Gemini reasons,
-    # while NVIDIA NIM parses structured predictions.
+    # Forecasting calls rotate across NVIDIA NIM; Gemini parses outputs and is
+    # also the automatic fallback for transient NIM failures.
     primary_model, parser_model = API_SETTINGS.llm_models()
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
@@ -641,15 +684,15 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            "default": GeneralLlm(
-                model=primary_model,
+            "default": ResilientGeneralLlm(
+                provider_model=primary_model,
                 temperature=0.3,
-                api_key=API_SETTINGS.llm_api_key(primary_model),
+                settings=API_SETTINGS,
             ),
-            "parser": GeneralLlm(
-                model=parser_model,
+            "parser": ResilientGeneralLlm(
+                provider_model=parser_model,
                 temperature=0,
-                api_key=API_SETTINGS.llm_api_key(parser_model),
+                settings=API_SETTINGS,
             ),
         },
     )
