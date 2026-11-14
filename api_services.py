@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import logging
 import os
-import random
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -15,21 +13,37 @@ from weakref import WeakKeyDictionary
 
 import requests
 from litellm import acompletion
-from litellm.exceptions import APIConnectionError, APIError
-from litellm.exceptions import Timeout as LiteLLMTimeout
+from litellm.exceptions import (
+    APIConnectionError,
+    APIError,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
 
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_NIM_MODELS = (
-    "deepseek-ai/deepseek-r1",
-    "qwen/qwen3-235b-a22b",
-    "meta/llama-3.3-70b-instruct",
+NVIDIA_PRIMARY_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+NVIDIA_SECONDARY_MODELS = (
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "mistralai/mistral-large-4-1t-a52b",
+    "minimaxai/minimax-m3.1-flash",
+    "meta/muse-glimmer-30b",
+    "nvidia/nemotron-3.5-bolt-e4b",
+)
+NVIDIA_NIM_MODELS = (NVIDIA_PRIMARY_MODEL, *NVIDIA_SECONDARY_MODELS)
+NVIDIA_SUMMARIZER_MODELS = (
+    "minimaxai/minimax-m3.1-flash",
+    "nvidia/nemotron-3.5-bolt-e4b",
+    "mistralai/mistral-large-4-1t-a52b",
 )
 GEMINI_MODEL = "gemini/gemini-2.5-flash"
-_NVIDIA_MODEL_CYCLE = itertools.cycle(NVIDIA_NIM_MODELS)
 _NVIDIA_MODEL_LOCK = threading.Lock()
+_DEAD_MODELS: set[str] = set()
+_available_nvidia_models: set[str] | None = None
 _NVIDIA_REQUEST_INTERVAL_SECONDS = 1.5
 _NVIDIA_MAX_CONCURRENT_REQUESTS = 2
-_NVIDIA_MAX_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
@@ -71,6 +85,7 @@ class ApiSettings:
     tavily_search_enabled: bool = True
     parallel_search_enabled: bool = True
     gemini_grounded_search_enabled: bool = True
+    nvidia_catalog_check_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> ApiSettings:
@@ -86,6 +101,9 @@ class ApiSettings:
             parallel_search_enabled=_read_flag("PARALLEL_SEARCH_ENABLED"),
             gemini_grounded_search_enabled=_read_flag(
                 "GEMINI_GROUNDED_SEARCH_ENABLED"
+            ),
+            nvidia_catalog_check_enabled=_read_flag(
+                "NVIDIA_MODEL_CATALOG_CHECK", default=False
             ),
         )
 
@@ -114,19 +132,30 @@ class ApiSettings:
         )
 
     def llm_models(self) -> tuple[str, str]:
-        """Return the forecast and parser providers."""
+        """Return the forecasting and structured-output model selections."""
         if self.gemini_api_key and self.nvidia_api_key:
-            return "nvidia_nim", GEMINI_MODEL
+            return (
+                f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+                f"nvidia_nim/{NVIDIA_SUMMARIZER_MODELS[0]}",
+            )
         if self.gemini_api_key:
             return GEMINI_MODEL, GEMINI_MODEL
         if self.nvidia_api_key:
-            return "nvidia_nim", "nvidia_nim"
+            return (
+                f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+                f"nvidia_nim/{NVIDIA_SUMMARIZER_MODELS[0]}",
+            )
         raise ValueError("No approved LLM API key is configured.")
 
     def llm_api_key(self, model: str) -> str:
         if model.startswith("gemini/") and self.gemini_api_key:
             return self.gemini_api_key
-        if model == "nvidia_nim" and self.nvidia_api_key:
+        if (
+            self.nvidia_api_key
+            and (model == "nvidia_nim" or model.startswith("nvidia_nim/"))
+        ):
+            return self.nvidia_api_key
+        if model in NVIDIA_NIM_MODELS and self.nvidia_api_key:
             return self.nvidia_api_key
         raise ValueError(f"No configured API key for model provider in {model!r}.")
 
@@ -285,51 +314,113 @@ class _NvidiaRateLimiter:
 _NVIDIA_RATE_LIMITER = _NvidiaRateLimiter()
 
 
-def _is_temporary_nvidia_error(error: Exception) -> bool:
-    status_code = getattr(error, "status_code", None)
-    response = getattr(error, "response", None)
-    if status_code is None and response is not None:
-        status_code = getattr(response, "status_code", None)
-    if status_code in {429, 503}:
-        return True
-    if isinstance(error, (asyncio.TimeoutError, TimeoutError, requests.Timeout)):
-        return True
-    return type(error).__name__.lower() in {
-        "apiconnectionerror",
-        "connecttimeout",
-        "readtimeout",
-        "timeout",
+def refresh_nvidia_model_catalog(settings: ApiSettings) -> tuple[str, ...]:
+    """Fetch NIM's live catalog and restrict runtime choices to advertised models."""
+    global _available_nvidia_models
+    if not settings.nvidia_api_key:
+        raise ValueError("NVIDIA_API_KEY is required to check the NVIDIA model catalog.")
+
+    response = requests.get(
+        f"{NVIDIA_NIM_BASE_URL}/models",
+        headers={"Authorization": f"Bearer {settings.nvidia_api_key}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise TypeError("NVIDIA model catalog response did not contain a data list.")
+    available = {
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     }
+    _available_nvidia_models = available
+    return tuple(model for model in NVIDIA_NIM_MODELS if model in available)
+
+
+def _nvidia_model_chain(model: str) -> tuple[str, ...]:
+    clean_model = normalize_nvidia_model_id(model) if model != "nvidia_nim" else ""
+    if not clean_model:
+        return NVIDIA_NIM_MODELS
+    if clean_model in NVIDIA_SUMMARIZER_MODELS:
+        return NVIDIA_SUMMARIZER_MODELS
+    if clean_model not in NVIDIA_NIM_MODELS:
+        raise ValueError(f"Unapproved NVIDIA NIM model configured: {clean_model!r}.")
+    start = NVIDIA_NIM_MODELS.index(clean_model)
+    return NVIDIA_NIM_MODELS[start:]
+
+
+def normalize_nvidia_model_id(model: str) -> str:
+    clean_model = model.strip()
+    while clean_model.startswith(("openai/", "nvidia_nim/")):
+        clean_model = clean_model.split("/", maxsplit=1)[1]
+    return clean_model
+
+
+def _is_retired_model_error(error: Exception) -> bool:
+    if isinstance(error, NotFoundError):
+        return True
+    if not isinstance(error, APIError):
+        return False
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+    return status_code in {404, 410}
 
 
 async def _call_nvidia_with_fallback(
-    nvidia_call: Callable[[], Awaitable[T]],
+    model_chain: tuple[str, ...],
+    nvidia_call: Callable[[str], Awaitable[T]],
     gemini_call: Callable[[], Awaitable[T]] | None,
-    *,
-    has_gemini_key: bool,
 ) -> T:
     last_error: Exception | None = None
-    for attempt in range(_NVIDIA_MAX_ATTEMPTS):
+    for model in model_chain:
+        with _NVIDIA_MODEL_LOCK:
+            if model in _DEAD_MODELS:
+                continue
+            if _available_nvidia_models is not None and model not in _available_nvidia_models:
+                continue
         try:
-            return await _NVIDIA_RATE_LIMITER.run(nvidia_call)
-        except (APIConnectionError, APIError, LiteLLMTimeout, TimeoutError, requests.RequestException) as error:
-            if not _is_temporary_nvidia_error(error):
-                raise
+            return await _NVIDIA_RATE_LIMITER.run(
+                lambda model=model: nvidia_call(model)
+            )
+        except (
+            RateLimitError,
+            InternalServerError,
+            ServiceUnavailableError,
+            APIConnectionError,
+            Timeout,
+        ) as error:
+            logger.warning(
+                "NVIDIA NIM model %s failed transiently (%s); trying the next model.",
+                model,
+                type(error).__name__,
+            )
             last_error = error
-            if attempt + 1 < _NVIDIA_MAX_ATTEMPTS:
-                delay = min(2**attempt, 8) + random.uniform(0, 0.5)
-                await asyncio.sleep(delay)
+        except (NotFoundError, APIError) as error:
+            if not _is_retired_model_error(error):
+                raise
+            with _NVIDIA_MODEL_LOCK:
+                _DEAD_MODELS.add(model)
+            logger.warning(
+                "NVIDIA NIM model %s returned HTTP %s; marking it unavailable and trying the next model.",
+                model,
+                getattr(
+                    error,
+                    "status_code",
+                    getattr(getattr(error, "response", None), "status_code", "unknown"),
+                ),
+            )
+            last_error = error
 
-    if has_gemini_key and gemini_call is not None:
-        logger.warning(
-            "NVIDIA NIM remained unavailable after %s attempts; falling back to Gemini (%s).",
-            _NVIDIA_MAX_ATTEMPTS,
-            type(last_error).__name__ if last_error else "unknown error",
-        )
+    if gemini_call is not None:
+        logger.warning("All available NVIDIA NIM models failed; falling back to Gemini.")
         return await gemini_call()
     if last_error is not None:
         raise last_error
-    raise RuntimeError("NVIDIA NIM request ended without a response.")
+    raise RuntimeError("No active NVIDIA NIM model is available for this request.")
 
 
 def _extract_completion_text(response: Any) -> str:
@@ -367,39 +458,37 @@ async def complete_llm(
 
     if selected_model.startswith("gemini/"):
         return await gemini_call()
-    if selected_model != "nvidia_nim" and not selected_model.startswith("nvidia_nim/"):
-        raise ValueError(f"Unapproved LLM provider configured: {selected_model!r}.")
+    if selected_model == "nvidia_nim":
+        model_selection = selected_model
+    else:
+        model_selection = normalize_nvidia_model_id(selected_model)
+    if model_selection not in {"nvidia_nim", ""} and (
+        model_selection not in NVIDIA_NIM_MODELS
+        and model_selection not in NVIDIA_SUMMARIZER_MODELS
+    ):
+        raise ValueError(
+            f"Unapproved NVIDIA NIM model configured: {selected_model!r}."
+        )
     if not settings.nvidia_api_key:
         raise ValueError("NVIDIA_API_KEY is not configured.")
 
-    explicit_model = (
-        selected_model.removeprefix("nvidia_nim/")
-        if selected_model.startswith("nvidia_nim/")
-        else ""
-    )
-    if explicit_model and explicit_model not in NVIDIA_NIM_MODELS:
-        raise ValueError(f"Unapproved NVIDIA NIM model configured: {explicit_model!r}.")
-    if explicit_model:
-        nim_model = explicit_model
-    else:
-        with _NVIDIA_MODEL_LOCK:
-            nim_model = next(_NVIDIA_MODEL_CYCLE)
+    model_chain = _nvidia_model_chain(model_selection or "nvidia_nim")
 
-    async def nvidia_call() -> str:
+    async def nvidia_call(nim_model: str) -> str:
         response = await acompletion(
-            model=f"openai/{nim_model}",
+            model=f"openai/{normalize_nvidia_model_id(nim_model)}",
             messages=messages,
             temperature=temperature,
             api_key=settings.nvidia_api_key,
-            base_url=NVIDIA_NIM_BASE_URL,
+            api_base=NVIDIA_NIM_BASE_URL,
             timeout=60,
         )
         return _extract_completion_text(response)
 
     return await _call_nvidia_with_fallback(
+        model_chain,
         nvidia_call,
         gemini_call if settings.gemini_api_key else None,
-        has_gemini_key=bool(settings.gemini_api_key),
     )
 
 

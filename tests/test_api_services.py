@@ -1,17 +1,22 @@
-import itertools
 import os
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import requests
+from litellm.exceptions import APIError, RateLimitError
 
 import api_services
 from api_services import (
     GEMINI_MODEL,
     NVIDIA_NIM_BASE_URL,
     NVIDIA_NIM_MODELS,
+    NVIDIA_PRIMARY_MODEL,
+    NVIDIA_SECONDARY_MODELS,
+    NVIDIA_SUMMARIZER_MODELS,
     ApiSettings,
     complete_llm,
+    normalize_nvidia_model_id,
+    refresh_nvidia_model_catalog,
     search_research,
 )
 
@@ -38,9 +43,15 @@ class ApiSettingsTests(unittest.TestCase):
         self.assertEqual(settings.validation_problems(), [])
         self.assertEqual(
             settings.llm_models(),
-            ("nvidia_nim", GEMINI_MODEL),
+            (
+                f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+                f"nvidia_nim/{NVIDIA_SUMMARIZER_MODELS[0]}",
+            ),
         )
-        self.assertEqual(settings.llm_api_key("nvidia_nim"), "nvidia-test")
+        self.assertEqual(
+            settings.llm_api_key(f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}"),
+            "nvidia-test",
+        )
 
     def test_requires_metaculus_and_at_least_one_llm_but_not_search_keys(self) -> None:
         placeholders = {
@@ -81,6 +92,11 @@ class ApiSettingsTests(unittest.TestCase):
         self.assertFalse(settings.gemini_grounded_search_enabled)
         self.assertFalse(settings.parallel_search_enabled)
         self.assertTrue(settings.tavily_search_enabled)
+
+    def test_reads_catalog_check_flag_disabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = ApiSettings.from_env()
+        self.assertFalse(settings.nvidia_catalog_check_enabled)
 
     def test_disables_search_providers_without_making_requests(self) -> None:
         settings = ApiSettings(
@@ -214,7 +230,7 @@ class SearchResearchTests(unittest.TestCase):
 
 
 class NvidiaFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_default_nim_provider_rotates_through_approved_models(self) -> None:
+    async def test_nim_primary_uses_free_endpoint_and_normalized_model_id(self) -> None:
         settings = ApiSettings(
             exa_api_secret=None,
             gemini_api_key="gemini-test",
@@ -234,28 +250,33 @@ class NvidiaFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("api_services.acompletion", side_effect=fake_completion),
-            patch(
-                "api_services._NVIDIA_MODEL_CYCLE",
-                itertools.cycle(NVIDIA_NIM_MODELS),
-            ),
             patch.object(
                 api_services._NVIDIA_RATE_LIMITER,
                 "run",
                 new=immediate_run,
             ),
         ):
-            for _ in NVIDIA_NIM_MODELS:
-                await complete_llm("Forecast prompt", settings, model="nvidia_nim")
+            answer = await complete_llm(
+                "Forecast prompt",
+                settings,
+                model=f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+            )
 
+        self.assertEqual(answer, "NIM response")
+        self.assertEqual(len(call_args), 1)
+        self.assertEqual(call_args[0]["model"], f"openai/{NVIDIA_PRIMARY_MODEL}")
+        self.assertEqual(call_args[0]["api_base"], NVIDIA_NIM_BASE_URL)
+        self.assertNotIn("base_url", call_args[0])
+
+    def test_strips_repeated_litellm_prefixes(self) -> None:
         self.assertEqual(
-            [call["model"] for call in call_args],
-            [f"openai/{model}" for model in NVIDIA_NIM_MODELS],
-        )
-        self.assertTrue(
-            all(call["base_url"] == NVIDIA_NIM_BASE_URL for call in call_args)
+            normalize_nvidia_model_id(
+                f"openai/nvidia_nim/openai/{NVIDIA_PRIMARY_MODEL}"
+            ),
+            NVIDIA_PRIMARY_MODEL,
         )
 
-    async def test_nim_uses_free_endpoint_models_and_falls_back_to_gemini(self) -> None:
+    async def test_transient_errors_fall_through_roster_then_gemini(self) -> None:
         settings = ApiSettings(
             exa_api_secret=None,
             gemini_api_key="gemini-test",
@@ -265,14 +286,11 @@ class NvidiaFallbackTests(unittest.IsolatedAsyncioTestCase):
             tavily_api_key=None,
         )
 
-        throttled = requests.HTTPError("throttled")
-        throttled.response = Mock(status_code=429)
-
         responses = [
-            throttled,
-            throttled,
-            throttled,
-            _completion("Gemini fallback"),
+            RateLimitError("throttled", "openai", model)
+            for model in NVIDIA_NIM_MODELS
+        ] + [
+            _completion("Gemini fallback")
         ]
 
         async def fake_completion(**kwargs: object) -> Mock:
@@ -293,25 +311,166 @@ class NvidiaFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "run",
                 new=immediate_run,
             ),
-            patch("api_services.asyncio.sleep", new=AsyncMock()),
-            patch("api_services.random.uniform", return_value=0),
         ):
             answer = await complete_llm(
                 "Forecast prompt",
                 settings,
-                model=f"nvidia_nim/{NVIDIA_NIM_MODELS[0]}",
+                model=f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
             )
 
         self.assertEqual(answer, "Gemini fallback")
-        self.assertEqual(len(call_args), 4)
+        self.assertEqual(len(call_args), len(NVIDIA_NIM_MODELS) + 1)
         self.assertTrue(
-            all(call["model"] == f"openai/{NVIDIA_NIM_MODELS[0]}" for call in call_args[:2])
+            [call["model"] for call in call_args[:-1]]
+            == [f"openai/{model}" for model in NVIDIA_NIM_MODELS]
         )
         self.assertTrue(
-            all(call["base_url"] == NVIDIA_NIM_BASE_URL for call in call_args[:3])
+            all(call["api_base"] == NVIDIA_NIM_BASE_URL for call in call_args[:-1])
         )
-        self.assertEqual(call_args[3]["model"], GEMINI_MODEL)
-        self.assertEqual(call_args[3]["api_key"], "gemini-test")
+        self.assertEqual(call_args[-1]["model"], GEMINI_MODEL)
+        self.assertEqual(call_args[-1]["api_key"], "gemini-test")
+
+    async def test_410_marks_model_dead_and_skips_it_on_later_calls(self) -> None:
+        settings = ApiSettings(
+            exa_api_secret=None,
+            gemini_api_key="gemini-test",
+            metaculus_token="metaculus-test",
+            nvidia_api_key="nvidia-test",
+            parallel_api_key=None,
+            tavily_api_key=None,
+        )
+        call_args: list[dict[str, object]] = []
+        eol = APIError(410, "model gone", "openai", NVIDIA_PRIMARY_MODEL)
+
+        async def fake_completion(**kwargs: object) -> Mock:
+            call_args.append(kwargs)
+            if len(call_args) == 1:
+                raise eol
+            return _completion("NIM response")
+
+        async def immediate_run(request):
+            return await request()
+
+        with (
+            patch("api_services.acompletion", side_effect=fake_completion),
+            patch.object(api_services, "_DEAD_MODELS", set()),
+            patch.object(
+                api_services._NVIDIA_RATE_LIMITER,
+                "run",
+                new=immediate_run,
+            ),
+        ):
+            first = await complete_llm(
+                "Forecast prompt",
+                settings,
+                model=f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+            )
+            after_first = len(call_args)
+            second = await complete_llm(
+                "Another prompt",
+                settings,
+                model=f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+            )
+
+        self.assertEqual(first, "NIM response")
+        self.assertEqual(second, "NIM response")
+        self.assertEqual(call_args[0]["model"], f"openai/{NVIDIA_PRIMARY_MODEL}")
+        self.assertEqual(
+            call_args[1]["model"],
+            f"openai/{NVIDIA_SECONDARY_MODELS[0]}",
+        )
+        self.assertEqual(
+            call_args[after_first]["model"],
+            f"openai/{NVIDIA_SECONDARY_MODELS[0]}",
+        )
+
+    async def test_404_model_is_cached_and_catalog_filters_candidates(self) -> None:
+        settings = ApiSettings(
+            exa_api_secret=None,
+            gemini_api_key="gemini-test",
+            metaculus_token="metaculus-test",
+            nvidia_api_key="nvidia-test",
+            parallel_api_key=None,
+            tavily_api_key=None,
+        )
+        call_args: list[dict[str, object]] = []
+        not_found = api_services.NotFoundError(
+            "model not found",
+            NVIDIA_PRIMARY_MODEL,
+            "openai",
+        )
+        response = Mock()
+        response.json.return_value = {
+            "data": [
+                {"id": NVIDIA_PRIMARY_MODEL},
+                {"id": NVIDIA_SECONDARY_MODELS[1]},
+            ]
+        }
+
+        async def fake_completion(**kwargs: object) -> Mock:
+            call_args.append(kwargs)
+            if len(call_args) == 1:
+                raise not_found
+            return _completion("NIM response")
+
+        async def immediate_run(request):
+            return await request()
+
+        with (
+            patch("api_services.requests.get", return_value=response),
+            patch("api_services.acompletion", side_effect=fake_completion),
+            patch.object(api_services, "_DEAD_MODELS", set()),
+            patch.object(api_services, "_available_nvidia_models", None),
+            patch.object(
+                api_services._NVIDIA_RATE_LIMITER,
+                "run",
+                new=immediate_run,
+            ),
+        ):
+            available = refresh_nvidia_model_catalog(settings)
+            answer = await complete_llm(
+                "Forecast prompt",
+                settings,
+                model=f"nvidia_nim/{NVIDIA_PRIMARY_MODEL}",
+            )
+
+        self.assertEqual(
+            available,
+            (NVIDIA_PRIMARY_MODEL, NVIDIA_SECONDARY_MODELS[1]),
+        )
+        self.assertEqual(answer, "NIM response")
+        self.assertEqual(len(call_args), 2)
+        self.assertEqual(call_args[0]["model"], f"openai/{NVIDIA_PRIMARY_MODEL}")
+        self.assertEqual(
+            call_args[1]["model"],
+            f"openai/{NVIDIA_SECONDARY_MODELS[1]}",
+        )
+
+    def test_filters_roster_from_live_nvidia_catalog(self) -> None:
+        settings = ApiSettings(
+            exa_api_secret=None,
+            gemini_api_key=None,
+            metaculus_token="metaculus-test",
+            nvidia_api_key="nvidia-test",
+            parallel_api_key=None,
+            tavily_api_key=None,
+        )
+        response = Mock()
+        response.json.return_value = {
+            "data": [{"id": NVIDIA_SECONDARY_MODELS[1]}, {"id": "unconfigured/model"}]
+        }
+        with (
+            patch("api_services.requests.get", return_value=response) as get,
+            patch.object(api_services, "_available_nvidia_models", None),
+        ):
+            available = refresh_nvidia_model_catalog(settings)
+
+        self.assertEqual(available, (NVIDIA_SECONDARY_MODELS[1],))
+        get.assert_called_once_with(
+            f"{NVIDIA_NIM_BASE_URL}/models",
+            headers={"Authorization": "Bearer nvidia-test"},
+            timeout=15,
+        )
 
     async def test_rejects_models_outside_the_approved_nim_roster(self) -> None:
         settings = ApiSettings(

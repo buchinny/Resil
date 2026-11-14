@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from api_services import ApiSettings
+from api_services import (
+    NVIDIA_NIM_BASE_URL,
+    NVIDIA_PRIMARY_MODEL,
+    ApiSettings,
+)
 from main import ResilientGeneralLlm
 
 
@@ -40,3 +44,5 @@ class ResilientGeneralLlmTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(call_args.kwargs["model"], "nvidia_nim")
         self.assertEqual(call_args.kwargs["temperature"], 0.2)
+        self.assertEqual(llm.model, f"openai/{NVIDIA_PRIMARY_MODEL}")
+        self.assertEqual(llm.litellm_kwargs["api_base"], NVIDIA_NIM_BASE_URL)

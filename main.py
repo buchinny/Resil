@@ -10,8 +10,11 @@ from api_services import (
     GEMINI_MODEL,
     NVIDIA_NIM_BASE_URL,
     NVIDIA_NIM_MODELS,
+    NVIDIA_SUMMARIZER_MODELS,
     ApiSettings,
     complete_llm,
+    normalize_nvidia_model_id,
+    refresh_nvidia_model_catalog,
     search_research,
 )
 
@@ -61,19 +64,28 @@ class ResilientGeneralLlm(GeneralLlm):
     ) -> None:
         self.provider_model = provider_model
         self.api_settings = settings
-        if provider_model == "nvidia_nim":
-            model = f"openai/{NVIDIA_NIM_MODELS[0]}"
+        normalized_provider_model = normalize_nvidia_model_id(provider_model)
+        if provider_model == "nvidia_nim" or normalized_provider_model in (
+            *NVIDIA_NIM_MODELS,
+            *NVIDIA_SUMMARIZER_MODELS,
+        ):
+            model_id = (
+                NVIDIA_NIM_MODELS[0]
+                if provider_model == "nvidia_nim"
+                else normalized_provider_model
+            )
+            model = f"openai/{model_id}"
             api_key = settings.nvidia_api_key
-            base_url = NVIDIA_NIM_BASE_URL
+            api_base = NVIDIA_NIM_BASE_URL
         else:
             model = GEMINI_MODEL
             api_key = settings.gemini_api_key
-            base_url = None
+            api_base = None
         super().__init__(
             model=model,
             temperature=temperature,
             api_key=api_key,
-            base_url=base_url,
+            api_base=api_base,
             allowed_tries=1,
         )
 
@@ -669,12 +681,22 @@ if __name__ == "__main__":
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
+    if API_SETTINGS.nvidia_catalog_check_enabled and API_SETTINGS.nvidia_api_key:
+        available_models = refresh_nvidia_model_catalog(API_SETTINGS)
+        if not available_models:
+            logger.warning(
+                "The NVIDIA catalog has no configured models; the LLM router will use Gemini fallback if configured."
+            )
+        else:
+            logger.info(
+                "NVIDIA NIM models available from live catalog: %s", available_models
+            )
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Forecasting calls rotate across NVIDIA NIM; Gemini parses outputs and is
-    # also the automatic fallback for transient NIM failures.
-    primary_model, parser_model = API_SETTINGS.llm_models()
+    # Forecasting and research summarization use separate NVIDIA NIM rosters;
+    # Gemini is the configured fallback for NIM failures.
+    primary_model, summarizer_model = API_SETTINGS.llm_models()
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -689,8 +711,18 @@ if __name__ == "__main__":
                 temperature=0.3,
                 settings=API_SETTINGS,
             ),
+            "researcher": ResilientGeneralLlm(
+                provider_model=primary_model,
+                temperature=0.3,
+                settings=API_SETTINGS,
+            ),
             "parser": ResilientGeneralLlm(
-                provider_model=parser_model,
+                provider_model=summarizer_model,
+                temperature=0,
+                settings=API_SETTINGS,
+            ),
+            "summarizer": ResilientGeneralLlm(
+                provider_model=summarizer_model,
                 temperature=0,
                 settings=API_SETTINGS,
             ),
